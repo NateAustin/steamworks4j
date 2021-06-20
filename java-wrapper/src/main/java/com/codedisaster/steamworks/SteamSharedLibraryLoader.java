@@ -1,7 +1,10 @@
 package com.codedisaster.steamworks;
 
+import jdk.internal.jline.internal.Nullable;
+
 import java.io.*;
 import java.util.UUID;
+import java.util.zip.CRC32;
 
 class SteamSharedLibraryLoader {
 
@@ -101,16 +104,27 @@ class SteamSharedLibraryLoader {
 		try {
 			String librarySystemName = getPlatformLibName(libraryName);
 
-			File librarySystemPath = discoverExtractLocation(
-					SHARED_LIBRARY_EXTRACT_DIRECTORY + "/" + Version.getVersion(), librarySystemName);
-
 			if (libraryPath == null) {
-				// extract library from resource
-				extractLibrary(librarySystemPath, librarySystemName);
+				
+				if(OS == PLATFORM.Windows) {
+					// extract library from resource
+					tryLoadAll(librarySystemName);
+				} else {
+
+					File librarySystemPath = discoverExtractLocation(
+							SHARED_LIBRARY_EXTRACT_DIRECTORY + "/" + Version.getVersion(), librarySystemName);
+					extractLibrary(librarySystemPath, librarySystemName);
+					String absolutePath = librarySystemPath.getCanonicalPath();
+					System.load(absolutePath);
+				}
+				
+				
 			} else {
 				// read library from given path
 				File librarySourcePath = new File(libraryPath, librarySystemName);
 
+				File librarySystemPath = discoverExtractLocation(
+						SHARED_LIBRARY_EXTRACT_DIRECTORY + "/" + Version.getVersion(), librarySystemName);
 				if (OS != PLATFORM.Windows) {
 					// on MacOS & Linux, "extract" (copy) from source location
 					extractLibrary(librarySystemPath, librarySourcePath);
@@ -118,14 +132,126 @@ class SteamSharedLibraryLoader {
 					// on Windows, load the library from the source location
 					librarySystemPath = librarySourcePath;
 				}
+
+				String absolutePath = librarySystemPath.getCanonicalPath();
+				System.load(absolutePath);
 			}
 
-			String absolutePath = librarySystemPath.getCanonicalPath();
-			System.load(absolutePath);
-		} catch (IOException e) {
+			
+		} catch (Throwable e) {
 			throw new SteamException(e);
 		}
 	}
+
+	private static void tryLoadAll(String sharedLibName) {
+		if (sharedLibName == null) {
+			throw new RuntimeException("no shared library specified");
+		}
+
+		String sourceCrc = crc(SteamSharedLibraryLoader.class.getResourceAsStream("/" + sharedLibName));
+
+		File file;
+		Throwable ex;
+
+		// Temp directory with username in path.
+		String user = System.getProperty("user.name");
+		file = new File(System.getProperty("java.io.tmpdir") + "/jnigen/" + user + "/" + sourceCrc, sharedLibName);
+		ex = tryLoad(sharedLibName, sourceCrc, file);
+		if (ex == null) return;
+
+		// System provided temp directory.
+		try {
+			file = File.createTempFile(sourceCrc, null);
+			if (file.delete() && file.mkdir()) {
+
+
+				file = new File(file, sharedLibName);
+				ex = tryLoad(sharedLibName, sourceCrc, file);
+				if (ex == null) {
+					return;
+				}
+			}
+		} catch (Throwable ignored) {}
+
+		// User home.
+		file = new File(System.getProperty("user.home") + "/.libgdx/" + sourceCrc, sharedLibName);
+		ex = tryLoad(sharedLibName, sourceCrc, file);
+		if (ex == null) {
+			return;
+		}
+
+		// Relative directory.
+		file = new File(".temp/" + sourceCrc, sharedLibName);
+		ex = tryLoad(sharedLibName, sourceCrc, file);
+		if (ex == null) {
+			return;
+		}
+
+		// Fallback to java.library.path location, eg for applets.
+		file = new File(System.getProperty("java.library.path"), sharedLibName);
+		if (file.exists()) {
+			try {
+				System.load(file.getAbsolutePath());
+				return;
+			} catch (Throwable t) {
+				ex = t;
+			}
+		}
+
+		throw new RuntimeException(ex);
+	}
+
+
+	private static @Nullable Throwable tryLoad(String sharedLibName, String sourceCrc, File file) {
+
+		try {
+			String extractedCrc = null;
+			if (file.exists()) {
+				try {
+					extractedCrc = crc(new FileInputStream(file));
+				} catch (FileNotFoundException ignored) {
+				}
+			}
+
+			if (extractedCrc == null || !extractedCrc.equals(sourceCrc)) {
+				extractLibrary(file, sharedLibName);
+			}
+			
+			if (!file.exists()) {
+				return new RuntimeException("failed to extract library to path: " + file.getAbsolutePath());
+			}
+			System.load(file.getCanonicalPath());
+		} catch (Throwable t) {
+			//was an error. this is weirdly common, some machines can't load from the first or second choice locations.
+			return t;
+		}
+		//success!
+		return null;
+	}
+
+	/**
+	 * Returns a CRC of the remaining bytes in the stream.
+	 */
+	public static String crc(InputStream input) {
+		if (input == null) return "" + System.nanoTime(); // fallback
+		CRC32 crc = new CRC32();
+		byte[] buffer = new byte[4096];
+		try {
+			while (true) {
+				int length = input.read(buffer);
+				if (length == -1) break;
+				crc.update(buffer, 0, length);
+			}
+		} catch (Exception ex) {
+			try {
+				input.close();
+			} catch (Exception ignored) {
+			}
+		}
+		return Long.toString(crc.getValue());
+	}
+	
+	
 
 	private static void extractLibrary(File librarySystemPath, String librarySystemName) throws IOException {
 		extractLibrary(librarySystemPath,
@@ -138,7 +264,10 @@ class SteamSharedLibraryLoader {
 
 	private static void extractLibrary(File librarySystemPath, InputStream input) throws IOException {
 		if (input != null) {
-			try (FileOutputStream output = new FileOutputStream(librarySystemPath)) {
+			try  {
+				librarySystemPath.getParentFile().mkdirs();
+				librarySystemPath.delete();
+				FileOutputStream output = new FileOutputStream(librarySystemPath);
 				byte[] buffer = new byte[4096];
 				while (true) {
 					int length = input.read(buffer);
